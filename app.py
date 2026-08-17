@@ -107,7 +107,38 @@ recommendations, redirect to research you can actually provide —
 data on specific tickers, comparisons, or sector information."""
 
 
+# --- Caching -----------------------------------------------------
+# A DECORATOR: a function that wraps another function to add behavior
+# without changing its code. You've already used one of these —
+# @app.post("/chat") is a decorator FastAPI provides. This is us
+# writing our own, for the same underlying reason: add one piece of
+# behavior (caching) to many functions without repeating ourselves.
+CACHE = {}
+CACHE_TTL_SECONDS = 60  # how long a cached result stays valid
+
+
+def with_cache(fn):
+    def wrapper(*args, **kwargs):
+        # Build a unique key from the function name + its exact arguments,
+        # so get_stock_data("AAPL") and get_stock_data("TSLA") are cached separately.
+        key = fn.__name__ + str(args) + str(sorted(kwargs.items()))
+        now = time.time()
+
+        if key in CACHE:
+            cached_time, cached_value = CACHE[key]
+            if now - cached_time < CACHE_TTL_SECONDS:
+                print(f"  [cache hit: {key}]")
+                return cached_value
+
+        value = fn(*args, **kwargs)
+        CACHE[key] = (now, value)
+        return value
+
+    return wrapper
+
+
 # --- Tools (unchanged from Stage 6) ---------------------------------
+@with_cache
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -129,6 +160,7 @@ def get_stock_data(ticker):
         return {"error": f"Failed to fetch data for '{ticker}': {str(e)}"}
 
 
+@with_cache
 def get_news(ticker, limit=5):
     try:
         stock = yf.Ticker(ticker)
@@ -149,6 +181,7 @@ def get_news(ticker, limit=5):
         return {"error": f"Failed to fetch news for '{ticker}': {str(e)}"}
 
 
+@with_cache
 def get_institutional_holders(ticker, limit=5):
     try:
         stock = yf.Ticker(ticker)
@@ -163,6 +196,7 @@ def get_institutional_holders(ticker, limit=5):
         return {"error": f"Failed to fetch institutional holders for '{ticker}': {str(e)}"}
 
 
+@with_cache
 def get_price_history(ticker, period="6mo"):
     try:
         stock = yf.Ticker(ticker)
@@ -201,6 +235,7 @@ VALID_SECTORS = [
 ]
 
 
+@with_cache
 def get_sector_top_stocks(sector, limit=10):
     try:
         sector_data = yf.Sector(sector)
@@ -219,6 +254,7 @@ def get_sector_top_stocks(sector, limit=10):
         return {"error": f"Failed to fetch top companies for sector '{sector}': {str(e)}. Valid sectors are: {', '.join(VALID_SECTORS)}."}
 
 
+@with_cache
 def get_price_chart_data(ticker, period="6mo"):
     """Unlike our other tools, this one returns TWO things:
     - points: the full list of {date, close} — goes straight to the browser to draw, never touches the AI
@@ -253,6 +289,7 @@ def get_price_chart_data(ticker, period="6mo"):
         return None, {"error": f"Failed to fetch chart data for '{ticker}': {str(e)}"}
 
 
+@with_cache
 def get_crypto_data(symbol):
     """symbol should be Yahoo-style, e.g. 'BTC-USD', 'ETH-USD'."""
     try:
@@ -273,6 +310,7 @@ def get_crypto_data(symbol):
         return {"error": f"Failed to fetch crypto data for '{symbol}': {str(e)}"}
 
 
+@with_cache
 def get_forex_rate(pair):
     """pair should be Yahoo-style, e.g. 'EURUSD=X', 'GBPUSD=X'."""
     try:
@@ -297,6 +335,7 @@ def get_forex_rate(pair):
 MARKET_INDICES = {"S&P 500": "^GSPC", "Dow Jones": "^DJI", "Nasdaq": "^IXIC"}
 
 
+@with_cache
 def get_market_overview():
     try:
         indices = []
