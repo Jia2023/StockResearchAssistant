@@ -131,7 +131,17 @@ def with_cache(fn):
                 return cached_value
 
         value = fn(*args, **kwargs)
-        CACHE[key] = (now, value)
+
+        # Never cache a failure — an error should always be free to retry
+        # on the very next call, not stuck repeating for the full TTL.
+        # Two error shapes to check: a plain {"error": ...} dict (most
+        # tools), or a (None, {"error": ...}) tuple (get_price_chart_data).
+        is_error = (isinstance(value, dict) and "error" in value) or \
+                   (isinstance(value, tuple) and value[0] is None)
+
+        if not is_error:
+            CACHE[key] = (now, value)
+
         return value
 
     return wrapper
