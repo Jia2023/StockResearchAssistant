@@ -483,6 +483,13 @@ def run_agent_turn(messages):
                 result_for_ai = AVAILABLE_TOOLS[block.name](**block.input)
                 print(f"  [agent called {block.name}({block.input})]")
 
+            # Log the RAW error to the server console whenever a tool fails —
+            # separate from whatever paraphrased explanation the AI gives the
+            # user. This is what lets us actually diagnose a failure later,
+            # instead of just guessing based on the AI's summary of it.
+            if isinstance(result_for_ai, dict) and "error" in result_for_ai:
+                print(f"  [TOOL ERROR] {block.name}({block.input}) -> {result_for_ai['error']}")
+
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
