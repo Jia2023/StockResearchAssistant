@@ -12,6 +12,7 @@ from app import (
     _fh_get_crypto_data,
     _fh_get_market_overview,
     _fh_get_sector_top_stocks,
+    _fh_get_earnings_calendar,
 )
 
 # Note: forex isn't tested here anymore — that fallback now uses Twelve
@@ -25,6 +26,7 @@ TESTS = [
     ("Crypto (BTC-USD)", lambda: _fh_get_crypto_data("BTC-USD")),
     ("Market overview", lambda: _fh_get_market_overview()),
     ("Sector top stocks (technology)", lambda: _fh_get_sector_top_stocks("technology", limit=3)),
+    ("Earnings calendar (AAPL)", lambda: _fh_get_earnings_calendar("AAPL")),
 ]
 
 for name, fn in TESTS:

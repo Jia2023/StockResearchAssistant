@@ -1,33 +1,21 @@
-# Quick standalone test — calls ONLY the Twelve Data functions directly,
-# bypassing yfinance and Finnhub entirely. Confirms your Twelve Data key
-# and the candle-parsing logic work before trusting it as a fallback.
+# Quick PROBE — not a permanent test, just checking whether Twelve Data
+# covers international stocks at all, and what symbol format it wants,
+# before we build any real fallback around it.
 #
-# RUN (from your StockAssistant folder, with TWELVE_DATA_API_KEY set):
-#     python3 test_twelvedata.py
+# RUN: python3 probe_twelvedata_international.py
 
-from app import _td_get_price_history, _td_get_price_chart_data, _td_get_forex_rate
+from app import twelvedata_get
 
-TESTS = [
-    ("Price history (AAPL, 1mo)", lambda: _td_get_price_history("AAPL", "1mo")),
-    ("Price history (AAPL, 1y)", lambda: _td_get_price_history("AAPL", "1y")),
-    ("Chart data (TSLA, 3mo)", lambda: _td_get_price_chart_data("TSLA", "3mo")),
-    ("Forex (EURUSD=X)", lambda: _td_get_forex_rate("EURUSD=X")),
+ATTEMPTS = [
+    ("RELIANCE.NS (Yahoo-style, direct)", {"symbol": "RELIANCE.NS"}),
+    ("RELIANCE + exchange=NSE", {"symbol": "RELIANCE", "exchange": "NSE"}),
+    ("RELIANCE + mic_code=XNSE", {"symbol": "RELIANCE", "mic_code": "XNSE"}),
 ]
 
-for name, fn in TESTS:
-    print(f"\n--- {name} ---")
+for label, params in ATTEMPTS:
+    print(f"\n--- {label} ---")
     try:
-        result = fn()
-        # Chart data returns a (points, summary) tuple; price history returns a plain dict.
-        if isinstance(result, tuple):
-            points, summary = result
-            if points is None:
-                print(f"  RETURNED ERROR: {summary.get('error')}")
-            else:
-                print(f"  OK: {len(points)} points, summary: {summary}")
-        elif isinstance(result, dict) and "error" in result:
-            print(f"  RETURNED ERROR: {result['error']}")
-        else:
-            print(f"  OK: {result}")
+        result = twelvedata_get("/quote", params)
+        print(f"  OK: {result}")
     except Exception as e:
-        print(f"  CRASHED: {type(e).__name__}: {e}")
+        print(f"  FAILED: {type(e).__name__}: {e}")

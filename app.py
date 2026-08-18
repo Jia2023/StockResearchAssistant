@@ -83,6 +83,12 @@ these facts rather than guessing:
   the current price sits just outside that range). This is a normal
   data quirk, not an error — mention it briefly and matter-of-factly
   if it comes up, rather than treating it as unusual.
+- Institutional holders and international (non-US) stocks have NO
+  backup data source — only the primary source covers them. If that
+  primary lookup fails for one of these, be honest that this specific
+  type of data has no fallback right now, rather than suggesting a
+  simple retry will likely fix it (retrying only helps if the primary
+  source's issue happens to be temporary, which isn't guaranteed).
 
 For further reading, you can point users to these resources when
 relevant (only when it adds value, not in every response):
@@ -734,6 +740,53 @@ def _fh_get_market_overview():
     return {"indices": indices, "market_news": market_news}
 
 
+@with_cache
+def get_earnings_calendar(ticker):
+    return try_then_fallback(_yf_get_earnings_calendar, _fh_get_earnings_calendar, ticker)
+
+
+def _yf_get_earnings_calendar(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        cal = stock.calendar  # dict-like: {"Earnings Date": [date, ...], "Earnings Average": ..., ...}
+
+        if not cal or not cal.get("Earnings Date"):
+            return {"error": f"No upcoming earnings date found for '{ticker}'."}
+
+        return {
+            "ticker": ticker,
+            "next_earnings_dates": [str(d) for d in cal["Earnings Date"]],
+            "eps_estimate_avg": cal.get("Earnings Average"),
+            "revenue_estimate_avg": cal.get("Revenue Average"),
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch earnings calendar for '{ticker}': {str(e)}"}
+
+
+def _fh_get_earnings_calendar(ticker):
+    import datetime
+    today = datetime.date.today()
+    # Requesting a wide window, but per Finnhub's own docs the free tier
+    # realistically only confirms about a month out — anything further
+    # simply won't be in the results yet, which is fine, not an error.
+    horizon = today + datetime.timedelta(days=180)
+
+    data = finnhub_get("/calendar/earnings", {
+        "symbol": ticker, "from": today.isoformat(), "to": horizon.isoformat()
+    })
+    items = data.get("earningsCalendar", [])
+
+    if not items:
+        return {"error": f"No upcoming earnings date found for '{ticker}' on Finnhub either."}
+
+    return {
+        "ticker": ticker,
+        "next_earnings_dates": [item.get("date") for item in items],
+        "eps_estimate_avg": items[0].get("epsEstimate"),
+        "revenue_estimate_avg": items[0].get("revenueEstimate"),
+    }
+
+
 AVAILABLE_TOOLS = {
     "get_stock_data": get_stock_data,
     "get_news": get_news,
@@ -743,6 +796,7 @@ AVAILABLE_TOOLS = {
     "get_crypto_data": get_crypto_data,
     "get_forex_rate": get_forex_rate,
     "get_market_overview": get_market_overview,
+    "get_earnings_calendar": get_earnings_calendar,
 }
 
 tool_definitions = [
@@ -787,6 +841,11 @@ tool_definitions = [
     {"name": "get_market_overview",
      "description": "Get a snapshot of overall US market conditions: major index levels (S&P 500, Dow Jones, Nasdaq) plus general market-moving news. Use this when the user asks broadly about 'the market' or 'markets today' rather than a specific stock, sector, or ticker.",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_earnings_calendar",
+     "description": "Get the next confirmed or estimated earnings report date(s) for a stock, plus EPS/revenue estimates if available. IMPORTANT: this returns only the next known date(s), not a full multi-month calendar — companies rarely confirm earnings dates more than a few weeks ahead. If asked for dates further out, use this tool anyway and be honest in your answer that only the near-term date is actually known yet.",
+     "input_schema": {"type": "object", "properties": {
+         "ticker": {"type": "string"}
+     }, "required": ["ticker"]}},
 ]
 
 
