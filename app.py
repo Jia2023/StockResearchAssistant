@@ -3,8 +3,10 @@
 # ==================================================================
 #
 # SETUP (run once in your terminal):
-#     pip install anthropic yfinance pandas fastapi uvicorn
+#     pip install anthropic yfinance pandas fastapi uvicorn requests
 #     export ANTHROPIC_API_KEY="your-key-here"
+#     export FINNHUB_API_KEY="your-finnhub-key-here"       (fallback: quotes, news)
+#     export TWELVE_DATA_API_KEY="your-twelvedata-key-here" (fallback: price history/charts)
 #
 # RUN:
 #     uvicorn app:app --reload
@@ -15,6 +17,7 @@ import json
 import os
 import time
 import uuid
+import requests
 import yfinance as yf
 from anthropic import Anthropic
 from fastapi import FastAPI, Request, HTTPException
@@ -59,13 +62,15 @@ correct one rather than risk showing the wrong company's data.
 
 If asked questions about the app itself (not a specific stock), use
 these facts rather than guessing:
-- Data comes from Yahoo Finance (via the yfinance library), an
-  unofficial source. It's not a licensed, real-time market data feed.
+- Data comes primarily from Yahoo Finance (via the yfinance library),
+  with Finnhub as an automatic backup source if Yahoo is temporarily
+  unavailable or rate-limiting. You don't need to mention which
+  source answered a given question unless asked directly.
 - Price data is close to real-time for US markets; international
   quotes may run 15-20 minutes delayed.
-- News headlines are aggregated by Yahoo from various outlets
-  (Reuters, Bloomberg, Benzinga, and others) — you cite the specific
-  outlet when referencing a headline, not "Yahoo" itself.
+- News headlines are aggregated from various outlets (Reuters,
+  Bloomberg, Benzinga, and others) — cite the specific outlet when
+  referencing a headline, not the aggregator itself.
 - Institutional holder and sector data is most reliable for US-listed
   companies and may be sparse or unavailable for smaller or non-US names.
 - This tool has no access to real-time trade execution, brokerage
@@ -147,9 +152,68 @@ def with_cache(fn):
     return wrapper
 
 
-# --- Tools (unchanged from Stage 6) ---------------------------------
+# --- Hybrid data sourcing: yfinance first, Finnhub as fallback ------
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+
+def finnhub_get(path, params):
+    params = {**params, "token": FINNHUB_API_KEY}
+    resp = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=10)
+    resp.raise_for_status()  # raises an exception on 4xx/5xx, e.g. Finnhub's own rate limit
+    return resp.json()
+
+
+# Twelve Data — used specifically for historical price data, since
+# Finnhub's candle endpoint is confirmed paid-tier-only (we tested it
+# directly and got a 403). Twelve Data's free tier (800 calls/day)
+# includes real historical daily bars at no cost.
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+TWELVE_DATA_BASE = "https://api.twelvedata.com"
+
+
+def twelvedata_get(path, params):
+    params = {**params, "apikey": TWELVE_DATA_API_KEY}
+    resp = requests.get(f"{TWELVE_DATA_BASE}{path}", params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    # Twelve Data returns HTTP 200 even for errors — the actual error
+    # shows up inside the JSON body instead, so we check for it explicitly.
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise RuntimeError(data.get("message", "Twelve Data returned an error."))
+    return data
+
+
+def try_then_fallback(primary_fn, fallback_fn, *args, **kwargs):
+    """Runs primary_fn (yfinance). If it raises OR returns an error dict,
+    logs that failure and tries fallback_fn (Finnhub) instead. Only
+    returns a real error if BOTH sources fail — this is what makes the
+    whole app resilient to either single provider having a bad day."""
+    try:
+        result = primary_fn(*args, **kwargs)
+        is_error = (isinstance(result, dict) and "error" in result) or \
+                   (isinstance(result, tuple) and result[0] is None)
+        if is_error:
+            raise RuntimeError(str(result))
+        return result
+    except Exception as primary_error:
+        print(f"  [PRIMARY (yfinance) failed: {primary_error} — falling back to Finnhub]")
+        if not FINNHUB_API_KEY:
+            return {"error": f"yfinance failed ({primary_error}) and no FINNHUB_API_KEY is set for fallback."}
+        try:
+            return fallback_fn(*args, **kwargs)
+        except Exception as fallback_error:
+            print(f"  [FALLBACK (Finnhub) also failed: {fallback_error}]")
+            return {"error": f"Both data sources failed. yfinance: {primary_error} | Finnhub: {fallback_error}"}
+
+
+# --- Tools -----------------------------------------------------------
 @with_cache
 def get_stock_data(ticker):
+    return try_then_fallback(_yf_get_stock_data, _fh_get_stock_data, ticker)
+
+
+def _yf_get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -170,8 +234,32 @@ def get_stock_data(ticker):
         return {"error": f"Failed to fetch data for '{ticker}': {str(e)}"}
 
 
+def _fh_get_stock_data(ticker):
+    quote = finnhub_get("/quote", {"symbol": ticker})
+    if not quote or quote.get("c") in (None, 0):
+        return {"error": f"No price data found for '{ticker}' on Finnhub either."}
+
+    profile = finnhub_get("/stock/profile2", {"symbol": ticker})
+    metrics = finnhub_get("/stock/metric", {"symbol": ticker, "metric": "all"}).get("metric", {})
+
+    return {
+        "ticker": ticker,
+        "company": profile.get("name", ticker),
+        "price": quote.get("c"),
+        "previous_close": quote.get("pc"),
+        "day_low": quote.get("l"),
+        "day_high": quote.get("h"),
+        "pe_ratio": metrics.get("peTTM"),
+        "forward_pe_ratio": metrics.get("peForward"),
+    }
+
+
 @with_cache
 def get_news(ticker, limit=5):
+    return try_then_fallback(_yf_get_news, _fh_get_news, ticker, limit=limit)
+
+
+def _yf_get_news(ticker, limit=5):
     try:
         stock = yf.Ticker(ticker)
         raw_news = stock.news
@@ -191,8 +279,37 @@ def get_news(ticker, limit=5):
         return {"error": f"Failed to fetch news for '{ticker}': {str(e)}"}
 
 
+def _fh_get_news(ticker, limit=5):
+    import datetime
+    today = datetime.date.today()
+    week_ago = today - datetime.timedelta(days=7)
+
+    items = finnhub_get("/company-news", {
+        "symbol": ticker,
+        "from": week_ago.isoformat(),
+        "to": today.isoformat(),
+    })
+
+    if not items:
+        return {"error": f"No recent news found for '{ticker}' on Finnhub either."}
+
+    headlines = []
+    for item in items[:limit]:
+        headlines.append({
+            "title": item.get("headline", "Untitled"),
+            "date": datetime.datetime.fromtimestamp(item.get("datetime", 0)).isoformat() if item.get("datetime") else "unknown date",
+            "source": item.get("source", "unknown source"),
+            "url": item.get("url", ""),
+        })
+    return headlines
+
+
 @with_cache
 def get_institutional_holders(ticker, limit=5):
+    return try_then_fallback(_yf_get_institutional_holders, _fh_get_institutional_holders, ticker, limit=limit)
+
+
+def _yf_get_institutional_holders(ticker, limit=5):
     try:
         stock = yf.Ticker(ticker)
         holders_df = stock.institutional_holders
@@ -206,8 +323,29 @@ def get_institutional_holders(ticker, limit=5):
         return {"error": f"Failed to fetch institutional holders for '{ticker}': {str(e)}"}
 
 
+def _fh_get_institutional_holders(ticker, limit=5):
+    data = finnhub_get("/stock/ownership", {"symbol": ticker, "limit": limit})
+    ownership = data.get("ownership", [])
+    if not ownership:
+        return {"error": f"No institutional holder data found for '{ticker}' on Finnhub either."}
+
+    holders = []
+    for h in ownership[:limit]:
+        holders.append({
+            "Holder": h.get("name", "unknown"),
+            "Shares": h.get("share"),
+            "Date Reported": h.get("filingDate", "unknown"),
+            "% Change": h.get("change"),
+        })
+    return holders
+
+
 @with_cache
 def get_price_history(ticker, period="6mo"):
+    return try_then_fallback(_yf_get_price_history, _td_get_price_history, ticker, period=period)
+
+
+def _yf_get_price_history(ticker, period="6mo"):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=period)
@@ -236,6 +374,66 @@ def get_price_history(ticker, period="6mo"):
         return {"error": f"Failed to fetch price history for '{ticker}': {str(e)}"}
 
 
+def _period_to_days(period):
+    # Twelve Data's outputsize parameter wants a number of trading days,
+    # not calendar days — using calendar days here is a slight
+    # overestimate, which is fine, since we just get a few extra points.
+    return {"5d": 5, "1mo": 22, "3mo": 65, "6mo": 130, "1y": 260,
+            "2y": 520, "5y": 1300, "max": 1300}.get(period, 130)
+
+
+def _td_get_candles(ticker, period):
+    """Shared by both get_price_history and get_price_chart_data —
+    fetches daily OHLC candles from Twelve Data for the given period."""
+    days = _period_to_days(period)
+
+    data = twelvedata_get("/time_series", {
+        "symbol": ticker, "interval": "1day", "outputsize": days
+    })
+
+    values = data.get("values")
+    if not values:
+        return None
+
+    # Twelve Data returns newest-first; we want chronological order,
+    # and every field comes back as a STRING, not a number — float()
+    # conversion is required here, unlike yfinance which gives native numbers.
+    points = []
+    for v in reversed(values):
+        points.append({
+            "date": v["datetime"],
+            "close": round(float(v["close"]), 2),
+            "high": round(float(v["high"]), 2),
+            "low": round(float(v["low"]), 2),
+        })
+    return points
+
+
+def _td_get_price_history(ticker, period="6mo"):
+    points = _td_get_candles(ticker, period)
+    if not points:
+        return {"error": f"No historical price data found for '{ticker}' on Twelve Data either."}
+
+    start, end = points[0], points[-1]
+    percent_change = round((end["close"] - start["close"]) / start["close"] * 100, 2)
+    high_point = max(points, key=lambda p: p["high"])
+    low_point = min(points, key=lambda p: p["low"])
+
+    return {
+        "ticker": ticker,
+        "period": period,
+        "start_date": start["date"],
+        "start_price": start["close"],
+        "end_date": end["date"],
+        "end_price": end["close"],
+        "percent_change": percent_change,
+        "period_high": high_point["high"],
+        "period_high_date": high_point["date"],
+        "period_low": low_point["low"],
+        "period_low_date": low_point["date"],
+    }
+
+
 # Valid sector keys yfinance understands — the AI must pick from this
 # exact list (enforced via "enum" in the tool definition below).
 VALID_SECTORS = [
@@ -247,21 +445,59 @@ VALID_SECTORS = [
 
 @with_cache
 def get_sector_top_stocks(sector, limit=10):
+    return try_then_fallback(_yf_get_sector_top_stocks, _fh_get_sector_top_stocks, sector, limit=limit)
+
+
+def _yf_get_sector_top_stocks(sector, limit=10):
     try:
         sector_data = yf.Sector(sector)
         top = sector_data.top_companies
-
         if top is None or top.empty:
             return {"error": f"No company data found for sector '{sector}'."}
-
-        top = top.head(limit).reset_index()  # ticker symbol is the index -> becomes a column
-        # Keep only the columns useful for a quick research overview
+        top = top.head(limit).reset_index()
         keep_cols = [c for c in ["symbol", "name", "market weight", "rating"] if c in top.columns]
         top = top[keep_cols] if keep_cols else top
-
         return top.to_dict(orient="records")
     except Exception as e:
         return {"error": f"Failed to fetch top companies for sector '{sector}': {str(e)}. Valid sectors are: {', '.join(VALID_SECTORS)}."}
+
+
+# Finnhub's free tier has no "top companies in a sector" endpoint, so the
+# fallback uses a small hardcoded list of major tickers per sector, then
+# pulls live quotes for each — less elegant than a live lookup, but fully
+# functional, and we control exactly which companies appear.
+SECTOR_TICKERS = {
+    "technology": ["NVDA", "AAPL", "MSFT", "AVGO", "ORCL"],
+    "healthcare": ["LLY", "UNH", "JNJ", "ABBV", "MRK"],
+    "financial-services": ["JPM", "V", "MA", "BAC", "WFC"],
+    "consumer-cyclical": ["AMZN", "TSLA", "HD", "MCD", "NKE"],
+    "industrials": ["GE", "CAT", "RTX", "UNP", "HON"],
+    "communication-services": ["GOOGL", "META", "NFLX", "DIS", "TMUS"],
+    "consumer-defensive": ["WMT", "PG", "KO", "PEP", "COST"],
+    "energy": ["XOM", "CVX", "COP", "SLB", "EOG"],
+    "basic-materials": ["LIN", "SHW", "FCX", "ECL", "NEM"],
+    "real-estate": ["PLD", "AMT", "EQIX", "SPG", "O"],
+    "utilities": ["NEE", "DUK", "SO", "D", "AEP"],
+}
+
+
+def _fh_get_sector_top_stocks(sector, limit=10):
+    tickers = SECTOR_TICKERS.get(sector)
+    if not tickers:
+        return {"error": f"Unknown sector '{sector}'. Valid sectors are: {', '.join(VALID_SECTORS)}."}
+
+    results = []
+    for t in tickers[:limit]:
+        try:
+            profile = finnhub_get("/stock/profile2", {"symbol": t})
+            quote = finnhub_get("/quote", {"symbol": t})
+            results.append({"symbol": t, "name": profile.get("name", t), "price": quote.get("c")})
+        except Exception:
+            continue  # skip a single bad ticker rather than failing the whole list
+
+    if not results:
+        return {"error": f"Could not fetch sector data for '{sector}' from Finnhub either."}
+    return results
 
 
 @with_cache
@@ -269,7 +505,29 @@ def get_price_chart_data(ticker, period="6mo"):
     """Unlike our other tools, this one returns TWO things:
     - points: the full list of {date, close} — goes straight to the browser to draw, never touches the AI
     - summary: a compact digest — goes to the AI, so it can talk about the chart without needing every data point
-    This keeps token usage low even for a 5-year daily chart with 1000+ points."""
+    This keeps token usage low even for a 5-year daily chart with 1000+ points.
+
+    Kept OUT of try_then_fallback deliberately: that helper's final failure
+    case returns a plain {"error": ...} dict, which would break the
+    `points, summary = get_price_chart_data(...)` unpacking in run_agent_turn
+    if both sources failed at once. This keeps the tuple shape consistent
+    on every path — success, fallback, or total failure."""
+    points, summary = _yf_get_price_chart_data(ticker, period)
+    if points is not None:
+        return points, summary
+
+    print(f"  [PRIMARY (yfinance) failed for chart: {summary.get('error')} — falling back to Twelve Data]")
+    if not TWELVE_DATA_API_KEY:
+        return None, {"error": f"yfinance failed ({summary.get('error')}) and no TWELVE_DATA_API_KEY is set for fallback."}
+
+    try:
+        return _td_get_price_chart_data(ticker, period)
+    except Exception as fallback_error:
+        print(f"  [FALLBACK (Twelve Data) also failed for chart: {fallback_error}]")
+        return None, {"error": f"Both data sources failed. yfinance: {summary.get('error')} | Twelve Data: {fallback_error}"}
+
+
+def _yf_get_price_chart_data(ticker, period="6mo"):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=period)
@@ -299,9 +557,33 @@ def get_price_chart_data(ticker, period="6mo"):
         return None, {"error": f"Failed to fetch chart data for '{ticker}': {str(e)}"}
 
 
+def _td_get_price_chart_data(ticker, period="6mo"):
+    candles = _td_get_candles(ticker, period)
+    if not candles:
+        return None, {"error": f"No historical price data found for '{ticker}' on Twelve Data either."}
+
+    points = [{"date": c["date"], "close": c["close"]} for c in candles]
+    closes = [p["close"] for p in points]
+    summary = {
+        "ticker": ticker,
+        "period": period,
+        "point_count": len(points),
+        "start_date": points[0]["date"],
+        "end_date": points[-1]["date"],
+        "min_close": min(closes),
+        "max_close": max(closes),
+        "note": "A chart has been displayed to the user showing this data. Do not repeat all the numbers — just briefly reference the trend."
+    }
+    return points, summary
+
+
 @with_cache
 def get_crypto_data(symbol):
     """symbol should be Yahoo-style, e.g. 'BTC-USD', 'ETH-USD'."""
+    return try_then_fallback(_yf_get_crypto_data, _fh_get_crypto_data, symbol)
+
+
+def _yf_get_crypto_data(symbol):
     try:
         coin = yf.Ticker(symbol)
         info = coin.info
@@ -320,9 +602,36 @@ def get_crypto_data(symbol):
         return {"error": f"Failed to fetch crypto data for '{symbol}': {str(e)}"}
 
 
+def _fh_get_crypto_data(symbol):
+    # Switched from /crypto/candle (paid-tier only, confirmed via testing)
+    # to /quote, which works on the free tier — same endpoint used for
+    # stocks, just pointed at a crypto symbol instead.
+    base = symbol.replace("-USD", "").replace("-USDT", "")
+    fh_symbol = f"BINANCE:{base}USDT"
+
+    quote = finnhub_get("/quote", {"symbol": fh_symbol})
+    price = quote.get("c")
+
+    if not price:
+        return {"error": f"No crypto data found for '{symbol}' on Finnhub either."}
+
+    return {
+        "symbol": symbol,
+        "name": base,
+        "price": price,
+        "previous_close": quote.get("pc"),
+        "day_low": quote.get("l"),
+        "day_high": quote.get("h"),
+    }
+
+
 @with_cache
 def get_forex_rate(pair):
     """pair should be Yahoo-style, e.g. 'EURUSD=X', 'GBPUSD=X'."""
+    return try_then_fallback(_yf_get_forex_rate, _td_get_forex_rate, pair)
+
+
+def _yf_get_forex_rate(pair):
     try:
         fx = yf.Ticker(pair)
         info = fx.info
@@ -340,13 +649,44 @@ def get_forex_rate(pair):
         return {"error": f"Failed to fetch forex rate for '{pair}': {str(e)}"}
 
 
+def _td_get_forex_rate(pair):
+    # Switched from Finnhub's /quote with OANDA-style symbols (confirmed
+    # paid-tier only via testing) to Twelve Data, reusing the key we
+    # already have working for price history. Twelve Data's forex symbol
+    # format uses a slash: "EUR/USD" rather than "EURUSD".
+    raw = pair.replace("=X", "")
+    base, quote_ccy = raw[:3], raw[3:6]
+    td_symbol = f"{base}/{quote_ccy}"
+
+    data = twelvedata_get("/quote", {"symbol": td_symbol})
+    rate = data.get("close")
+
+    if rate is None:
+        return {"error": f"No rate found for '{pair}' on Twelve Data either."}
+
+    return {
+        "pair": pair,
+        "rate": round(float(rate), 4),
+        "previous_close": round(float(data["previous_close"]), 4) if data.get("previous_close") else None,
+        "day_low": round(float(data["low"]), 4) if data.get("low") else None,
+        "day_high": round(float(data["high"]), 4) if data.get("high") else None,
+    }
+
+
 # Major US indices, used as a proxy for "the overall market" when the
 # user isn't asking about one specific stock.
 MARKET_INDICES = {"S&P 500": "^GSPC", "Dow Jones": "^DJI", "Nasdaq": "^IXIC"}
+# Finnhub free tier can't quote raw index symbols reliably — liquid ETFs
+# tracking the same indices work as a close, reliable proxy instead.
+MARKET_INDEX_ETF_PROXIES = {"S&P 500": "SPY", "Dow Jones": "DIA", "Nasdaq": "QQQ"}
 
 
 @with_cache
 def get_market_overview():
+    return try_then_fallback(_yf_get_market_overview, _fh_get_market_overview)
+
+
+def _yf_get_market_overview():
     try:
         indices = []
         for name, symbol in MARKET_INDICES.items():
@@ -362,9 +702,9 @@ def get_market_overview():
                 "percent_change": round((price - prev) / prev * 100, 2),
             })
 
-        # Reuse get_news, pointed at the S&P 500 index, as a stand-in
-        # for general market-moving headlines rather than one company's news.
-        market_news = get_news("^GSPC", limit=5)
+        # get_news is itself hybrid, so this call already self-heals to
+        # Finnhub if yfinance is down — no separate fallback needed here.
+        market_news = get_news("SPY", limit=5)
 
         if not indices:
             return {"error": "Could not fetch market index data."}
@@ -372,6 +712,26 @@ def get_market_overview():
         return {"indices": indices, "market_news": market_news}
     except Exception as e:
         return {"error": f"Failed to fetch market overview: {str(e)}"}
+
+
+def _fh_get_market_overview():
+    indices = []
+    for name, symbol in MARKET_INDEX_ETF_PROXIES.items():
+        quote = finnhub_get("/quote", {"symbol": symbol})
+        price, prev = quote.get("c"), quote.get("pc")
+        if not price or not prev:
+            continue
+        indices.append({
+            "name": f"{name} (via {symbol} ETF)",
+            "level": round(price, 2),
+            "percent_change": round((price - prev) / prev * 100, 2),
+        })
+
+    if not indices:
+        return {"error": "Could not fetch market index data from Finnhub either."}
+
+    market_news = get_news("SPY", limit=5)
+    return {"indices": indices, "market_news": market_news}
 
 
 AVAILABLE_TOOLS = {
