@@ -351,10 +351,22 @@ def get_price_history(ticker, period="6mo"):
     return try_then_fallback(_yf_get_price_history, _td_get_price_history, ticker, period=period)
 
 
+def _yf_history_for_period(stock, period):
+    """yfinance's period= only understands relative windows like '6mo' —
+    there's no built-in 'ytd'. So for that one case, we switch to its
+    start=/end= date-range mode instead, anchored at January 1st of the
+    current year. Every other period still uses the normal relative form."""
+    if period == "ytd":
+        import datetime
+        start = datetime.date(datetime.date.today().year, 1, 1)
+        return stock.history(start=start)
+    return stock.history(period=period)
+
+
 def _yf_get_price_history(ticker, period="6mo"):
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period=period)
+        hist = _yf_history_for_period(stock, period)
         if hist.empty:
             return {"error": f"No historical price data found for '{ticker}'."}
         hist = hist.reset_index()
@@ -384,6 +396,11 @@ def _period_to_days(period):
     # Twelve Data's outputsize parameter wants a number of trading days,
     # not calendar days — using calendar days here is a slight
     # overestimate, which is fine, since we just get a few extra points.
+    if period == "ytd":
+        import datetime
+        today = datetime.date.today()
+        jan1 = datetime.date(today.year, 1, 1)
+        return (today - jan1).days + 5  # small buffer for weekends/holidays
     return {"5d": 5, "1mo": 22, "3mo": 65, "6mo": 130, "1y": 260,
             "2y": 520, "5y": 1300, "max": 1300}.get(period, 130)
 
@@ -536,7 +553,7 @@ def get_price_chart_data(ticker, period="6mo"):
 def _yf_get_price_chart_data(ticker, period="6mo"):
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period=period)
+        hist = _yf_history_for_period(stock, period)
 
         if hist.empty:
             return None, {"error": f"No historical price data found for '{ticker}'."}
@@ -810,7 +827,7 @@ tool_definitions = [
      "description": "Get a summary of a stock's price performance over a past time period. Use for 'how has it done over time' type questions.",
      "input_schema": {"type": "object", "properties": {
          "ticker": {"type": "string"},
-         "period": {"type": "string", "enum": ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]}
+         "period": {"type": "string", "enum": ["5d", "1mo", "3mo", "6mo", "ytd", "1y", "2y", "5y", "max"]}
      }, "required": ["ticker"]}},
     {"name": "get_sector_top_stocks",
      "description": "Get the top/leading companies within a market sector, useful when the user wants to research or discover stocks in a particular sector or industry (e.g. 'good tech stocks', 'top energy companies').",
@@ -826,7 +843,7 @@ tool_definitions = [
      "description": "Display a visual price trend chart to the user. Use this whenever they ask to see a chart, graph, or visualize a trend — do not use get_price_history for this, use this instead when a visual is wanted.",
      "input_schema": {"type": "object", "properties": {
          "ticker": {"type": "string"},
-         "period": {"type": "string", "enum": ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]}
+         "period": {"type": "string", "enum": ["5d", "1mo", "3mo", "6mo", "ytd", "1y", "2y", "5y", "max"]}
      }, "required": ["ticker"]}},
     {"name": "get_crypto_data",
      "description": "Get the current price for a cryptocurrency. Symbol must be Yahoo-style with a -USD suffix, e.g. BTC-USD, ETH-USD, SOL-USD.",
